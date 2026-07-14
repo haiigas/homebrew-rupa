@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG="rupa"
+
+have()  { command -v "$1" >/dev/null 2>&1; }
+die()   { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — convert, extract, and compress media files
+
+usage:
+  $PROG convert <ext> <file>    change format (keeps name, swaps extension)
+  $PROG extract <ext> <file>    pull audio out of a video
+  $PROG compress <file>         shrink file size, same format
+  $PROG -h | --help
+  $PROG --version
+
+convert targets:
+  images   webp  avif  tiff  bmp  jpg  png
+  video    webm  mkv   mov   gif  mp4
+
+extract targets (input must be a video):
+  audio    mp3   m4a   wav
+
+examples:
+  $PROG convert webp photo.png       # photo.png  -> photo.webp
+  $PROG convert mp4  clip.mkv        # clip.mkv   -> clip.mp4
+  $PROG convert gif  clip.mov        # clip.mov   -> clip.gif
+  $PROG extract mp3  talk.mp4        # talk.mp4   -> talk.mp3
+  $PROG compress video.mp4           # video.mp4  -> video-compressed.mp4
+EOF
+}
+
+# ---- shared helpers -------------------------------------------------------
+
+draw_bar() {
+  local pct width=24 filled i bar=""
+  pct=$(( 10#${1:-0} ))
+  (( pct < 0 ))   && pct=0
+  (( pct > 100 )) && pct=100
+  filled=$(( pct * width / 100 ))
+  for (( i = 0; i < width; i++ )); do
+    if (( i < filled )); then bar+="█"; else bar+="░"; fi
+  done
+  printf '\r  [%s] %3d%%' "$bar" "$pct"
+}
+
+filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null; }
+
+human() {
+  awk -v b="$1" 'BEGIN{
+    split("B KB MB GB TB", u, " "); i=1
+    while (b >= 1024 && i < 5) { b/=1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
+  }'
+}
+
+size_delta() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    if (a <= 0) { print "n/a"; exit }
+    d = (a - b) / a * 100
+    if (d >= 0) printf "-%.0f%%", d; else printf "+%.0f%% larger", -d
+  }'
+}
+
+get_duration() {
+  ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null || echo ""
+}
+
+track_progress() {
+  local duration="$1" key value cur pct
+  while IFS='=' read -r key value; do
+    case "$key" in
+      out_time)
+        [[ "$value" == "N/A" || -z "$duration" ]] && continue
+        cur=$(awk -v s="$value" 'BEGIN{split(s,a,":"); print a[1]*3600+a[2]*60+a[3]}')
+        pct=$(awk -v c="$cur" -v d="$duration" 'BEGIN{ if(d>0){p=c/d*100; printf "%d",p} else print 0 }')
+        draw_bar "$pct"
+        ;;
+      progress) [[ "$value" == "end" ]] && draw_bar 100 ;;
+    esac
+  done
+}
+
+# ---- engines --------------------------------------------------------------
+
+ffmpeg_run() {
+  local input="$1" output="$2"; shift 2
+  local duration errlog status
+  duration=$(get_duration "$input")
+  errlog=$(mktemp)
+  ffmpeg -nostdin -hide_banner -loglevel error -i "$input" "$@" \
+    -progress pipe:1 -nostats "$output" 2>"$errlog" | track_progress "$duration"
+  status=${PIPESTATUS[0]}
+  printf '\n'
+  if (( status != 0 )); then cat "$errlog" >&2; rm -f "$errlog"; return 1; fi
+  rm -f "$errlog"
+}
+
+magick_run() {
+  local errlog status pct line
+  errlog=$(mktemp)
+  draw_bar 0
+  magick -monitor "$@" 2>&1 >/dev/null | tr '\r' '\n' | while IFS= read -r line; do
+    if [[ "$line" == *"% complete"* ]]; then
+      pct=${line##*, }; pct=${pct%%\%*}; draw_bar "$pct"
+    else
+      printf '%s\n' "$line" >>"$errlog"
+    fi
+  done
+  status=${PIPESTATUS[0]}
+  draw_bar 100
+  printf '\n'
+  if (( status != 0 )); then cat "$errlog" >&2; rm -f "$errlog"; return 1; fi
+  rm -f "$errlog"
+}
+
+gif_run() {
+  local input="$1" output="$2" fps=15 palette errlog duration status
+  palette="${TMPDIR:-/tmp}/rupa_palette_$$.png"
+  errlog=$(mktemp)
+  duration=$(get_duration "$input")
+
+  if ! ffmpeg -nostdin -hide_banner -loglevel error -i "$input" \
+        -vf "fps=${fps},palettegen" -y "$palette" 2>"$errlog"; then
+    printf '\n'; cat "$errlog" >&2; rm -f "$errlog" "$palette"; return 1
+  fi
+
+  ffmpeg -nostdin -hide_banner -loglevel error -i "$input" -i "$palette" \
+    -filter_complex "[0:v]fps=${fps}[x];[x][1:v]paletteuse" \
+    -progress pipe:1 -nostats -y "$output" 2>"$errlog" | track_progress "$duration"
+  status=${PIPESTATUS[0]}
+  printf '\n'
+  rm -f "$palette"
+  if (( status != 0 )); then cat "$errlog" >&2; rm -f "$errlog"; return 1; fi
+  rm -f "$errlog"
+}
+
+# ---- subcommands ----------------------------------------------------------
+
+cmd_convert() {
+  [[ $# -ge 2 ]] || die "usage: $PROG convert <ext> <file>   (example: $PROG convert webp photo.png)"
+  local ext input output
+  ext=$(lower "$1"); input="$2"
+  case "$ext" in
+    webp|avif|tiff|tif|bmp|jpg|jpeg|png|mp4|mkv|mov|webm|gif) ;;
+    *) die "unsupported convert target: $ext (try: $PROG --help)" ;;
+  esac
+  [[ -f "$input" ]] || die "file not found: $input"
+  output="${input%.*}.${ext}"
+  [[ -e "$output" ]] && die "output already exists: $output (remove it first)"
+  printf '%s -> %s\n' "$input" "$output"
+
+  case "$ext" in
+    webp|avif|tiff|tif|bmp|jpg|jpeg|png)
+      have magick || die "imagemagick not found — brew install imagemagick"
+      magick_run "$input" "$output" || die "failed to convert $input"
+      ;;
+    mp4|mkv|mov)
+      have ffmpeg || die "ffmpeg not found — brew install ffmpeg"
+      ffmpeg_run "$input" "$output" \
+        -c:v libx264 -crf 16 -preset slow -c:a aac -b:a 192k || die "failed to convert $input"
+      ;;
+    webm)
+      have ffmpeg || die "ffmpeg not found — brew install ffmpeg"
+      ffmpeg_run "$input" "$output" \
+        -c:v libvpx-vp9 -crf 32 -b:v 0 -c:a libopus || die "failed to convert $input"
+      ;;
+    gif)
+      have ffmpeg || die "ffmpeg not found — brew install ffmpeg"
+      gif_run "$input" "$output" || die "failed to convert $input"
+      ;;
+    *)
+      die "unsupported convert target: $ext (try: $PROG --help)"
+      ;;
+  esac
+  printf '✓ done: %s\n' "$output"
+}
+
+cmd_extract() {
+  [[ $# -ge 2 ]] || die "usage: $PROG extract <ext> <file>   (example: $PROG extract mp3 talk.mp4)"
+  local ext input output
+  ext=$(lower "$1"); input="$2"
+  case "$ext" in
+    mp3|m4a|wav) ;;
+    *) die "unsupported extract target: $ext (use mp3, m4a, or wav)" ;;
+  esac
+  [[ -f "$input" ]] || die "file not found: $input"
+  output="${input%.*}.${ext}"
+  [[ -e "$output" ]] && die "output already exists: $output (remove it first)"
+  have ffmpeg || die "ffmpeg not found — brew install ffmpeg"
+  printf '%s -> %s\n' "$input" "$output"
+
+  case "$ext" in
+    mp3) ffmpeg_run "$input" "$output" -vn -c:a libmp3lame -q:a 2   || die "failed to extract from $input" ;;
+    m4a) ffmpeg_run "$input" "$output" -vn -c:a aac -b:a 192k       || die "failed to extract from $input" ;;
+    wav) ffmpeg_run "$input" "$output" -vn -c:a pcm_s16le          || die "failed to extract from $input" ;;
+    *)   die "unsupported extract target: $ext (use mp3, m4a, or wav)" ;;
+  esac
+  printf '✓ done: %s\n' "$output"
+}
+
+cmd_compress() {
+  [[ $# -ge 1 ]] || die "usage: $PROG compress <file>   (example: $PROG compress video.mp4)"
+  local input="$1" ext output before after
+  [[ -f "$input" ]] || die "file not found: $input"
+  ext=$(lower "${input##*.}")
+  case "$ext" in
+    jpg|jpeg|webp|avif|png|tiff|tif|mp4|mkv|mov|webm|avi|m4v) ;;
+    bmp) die "bmp has no compression to apply — convert it to png or webp instead" ;;
+    *) die "don't know how to compress .$ext files" ;;
+  esac
+  output="${input%.*}-compressed.${ext}"
+  [[ -e "$output" ]] && die "output already exists: $output (remove it first)"
+  before=$(filesize "$input")
+  printf '%s -> %s\n' "$input" "$output"
+
+  case "$ext" in
+    jpg|jpeg|webp|avif)
+      have magick || die "imagemagick not found — brew install imagemagick"
+      magick_run "$input" -strip -quality 85 "$output" || die "failed to compress $input"
+      ;;
+    png)
+      have magick || die "imagemagick not found — brew install imagemagick"
+      magick_run "$input" -strip -define png:compression-level=9 "$output" || die "failed to compress $input"
+      ;;
+    tiff|tif)
+      have magick || die "imagemagick not found — brew install imagemagick"
+      magick_run "$input" -strip -compress LZW "$output" || die "failed to compress $input"
+      ;;
+    bmp)
+      die "bmp has no compression to apply — convert it to png or webp instead"
+      ;;
+    mp4|mkv|mov|webm|avi|m4v)
+      have ffmpeg || die "ffmpeg not found — brew install ffmpeg"
+      ffmpeg_run "$input" "$output" \
+        -c:v libx264 -crf 20 -preset slow -c:a aac -b:a 128k || die "failed to compress $input"
+      ;;
+    *)
+      die "don't know how to compress .$ext files"
+      ;;
+  esac
+
+  after=$(filesize "$output")
+  printf '✓ done: %s  (%s -> %s, %s)\n' \
+    "$output" "$(human "$before")" "$(human "$after")" "$(size_delta "$before" "$after")"
+}
+
+# ---- dispatch -------------------------------------------------------------
+
+main() {
+  case "${1:-}" in
+    ""|-h|--help) usage ;;
+    --version)    printf '%s %s\n' "$PROG" "$VERSION" ;;
+    convert)      shift; cmd_convert "$@" ;;
+    extract)      shift; cmd_extract "$@" ;;
+    compress)     shift; cmd_compress "$@" ;;
+    *)            die "unknown command: $1 (try: $PROG --help)" ;;
+  esac
+}
+
+main "$@"
