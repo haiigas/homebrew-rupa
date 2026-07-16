@@ -6,13 +6,12 @@ class Rupa < Formula
   license "MIT"
 
   depends_on "ffmpeg"
-  depends_on "imagemagick"
 
   def install
     bin.install "bin/rupa"
   end
 
   test do
-    assert_match "rupa 1.0.0", shell_output("#{bin}/rupa --version")
+    assert_match "rupa 1.0.1", shell_output("#{bin}/rupa --version")
   end
 end
