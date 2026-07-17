@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 PROG="rupa"
 
 have()  { command -v "$1" >/dev/null 2>&1; }
@@ -122,13 +122,15 @@ gif_run() {
   rm -f "$errlog"
 }
 
+MAGICK="$(brew --prefix 2>/dev/null)/opt/imagemagick/bin/magick"
+
 image_run() {
   local input="$1" output="$2"; shift 2
-  have ffmpeg || die "ffmpeg not found — brew install ffmpeg"
+  have "$MAGICK" || die "imagemagick not found — brew install imagemagick"
   local errlog status
   errlog=$(mktemp)
   printf '  converting…'
-  ffmpeg -nostdin -hide_banner -loglevel error -i "$input" "$@" -y "$output" 2>"$errlog"
+  "$MAGICK" "$input" "$@" "$output" 2>"$errlog"
   status=$?
   if (( status != 0 )); then printf '\n'; cat "$errlog" >&2; rm -f "$errlog"; return 1; fi
   rm -f "$errlog"
@@ -211,13 +213,13 @@ cmd_compress() {
 
   case "$ext" in
     jpg|jpeg)
-      image_run "$input" "$output" -q:v 3 || die "failed to compress $input"
+      image_run "$input" "$output" -quality 30% || die "failed to compress $input"
       ;;
     webp)
-      image_run "$input" "$output" -q:v 75 || die "failed to compress $input"
+      image_run "$input" "$output" -quality 75% || die "failed to compress $input"
       ;;
     avif)
-      image_run "$input" "$output" -q:v 75 -compression_level 3 || die "failed to compress $input"
+      image_run "$input" "$output" -quality 50% || die "failed to compress $input"
       ;;
     png)
       have sips || die "sips not available"
