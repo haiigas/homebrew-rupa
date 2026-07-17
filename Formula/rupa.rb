@@ -1,8 +1,8 @@
 class Rupa < Formula
   desc "Convert, extract audio from, and compress media"
   homepage "https://github.com/haiigas/homebrew-rupa"
-  url "https://github.com/haiigas/homebrew-rupa/archive/refs/tags/v1.0.1.tar.gz"
-  sha256 "9b472ef3fdd8c0fc040ea5bff7c4c429895c69915a567137a31f888d6b7d04f9"
+  url "https://github.com/haiigas/homebrew-rupa/archive/refs/tags/v1.0.2.tar.gz"
+  sha256 "723573d408367f0b19c77747927f193bad9b0d46a8da6653d6d474090ffbfaf9"
   license "MIT"
 
   depends_on "ffmpeg"
